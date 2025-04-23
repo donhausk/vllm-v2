@@ -10,6 +10,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import (TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set,
                     Tuple, Type, TypeVar, Union)
+from collections import defaultdict
 
 import numpy as np
 import torch
@@ -1111,6 +1112,9 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
               SamplingMetadataCache() \
                 if self.parallel_config.pipeline_parallel_size == 1 else None
 
+        # Accumulator for attention statistics
+        self.accumulated_attn_stats: defaultdict = defaultdict(int)
+
         if hasattr(self, "_builder_cls"):
             # multi-step model runner does not have `_builder_cls`
             self.builder = self._builder_cls(weakref.proxy(self))
@@ -1157,12 +1161,13 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
                     time_after_load - time_before_load)
         if self.prompt_adapter_config:
             self.prompt_adapter_manager = LRUCacheWorkerPromptAdapterManager(
-                self.scheduler_config.max_num_seqs,
-                self.scheduler_config.max_num_batched_tokens, self.device,
-                self.prompt_adapter_config)
-            self.model = (
-                self.prompt_adapter_manager.create_prompt_adapter_manager(
-                    self.model))
+                max_num_seqs=self.scheduler_config.max_num_seqs,
+                max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
+                device=self.device,
+                prompt_adapter_config=self.prompt_adapter_config
+            )
+            self.model = self.prompt_adapter_manager.create_prompt_adapter_manager(
+                    self.model)
 
         if self.vllm_config.compilation_config.level ==\
             CompilationLevel.DYNAMO_AS_IS and supports_dynamo():
@@ -1700,6 +1705,7 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
         if num_steps > 1:
             raise ValueError("num_steps > 1 is not supported in ModelRunner")
 
+        # --- Start Existing LoRA/Prompt Adapter Logic ---
         if self.lora_config:
             assert model_input.lora_requests is not None
             assert model_input.lora_mapping is not None
@@ -1712,24 +1718,24 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
             self.set_active_prompt_adapters(
                 model_input.prompt_adapter_requests,
                 model_input.prompt_adapter_mapping)
+        # --- End Existing LoRA/Prompt Adapter Logic ---
+
+        # (No deserialization needed here with this approach)
 
         self.attn_state.begin_forward(model_input)
 
-        # Currently cuda graph is only supported by the decode phase.
+        # --- Start Existing CUDA Graph / Model Executable Logic ---
         assert model_input.attn_metadata is not None
         prefill_meta = model_input.attn_metadata.prefill_metadata
         decode_meta = model_input.attn_metadata.decode_metadata
-        # TODO(andoorve): We can remove this once all
-        # virtual engines share the same kv cache.
         virtual_engine = model_input.virtual_engine
         previous_hidden_states = kwargs.get("previous_hidden_states")
         if prefill_meta is None and decode_meta.use_cuda_graph:
             assert model_input.input_tokens is not None
             graph_batch_size = model_input.input_tokens.shape[0]
-            model_executable = self.graph_runners[virtual_engine][
-                graph_batch_size]
+            model_executable = self.graph_runners[virtual_engine][graph_batch_size]
             if previous_hidden_states is not None:
-                previous_hidden_states = torch.cat([
+                 previous_hidden_states = torch.cat([
                     previous_hidden_states,
                     torch.empty([
                         graph_batch_size - previous_hidden_states.shape[0],
@@ -1740,24 +1746,19 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
                 ])
         else:
             model_executable = self.model
+        # --- End Existing CUDA Graph / Model Executable Logic ---
 
-        # Receive KV cache in distributed KV cache transfer setting
-        # In disagg prefill setting, it will also recv hidden states and bypass
-        # model forwarding
-        # In KV cache database setting, it will change the model input so that
-        # we can skip prefilling on tokens that successfully received KV caches
-        # NOTE: The receive operation is blocking
+        # --- Start Existing KV Cache Recv Logic ---
         bypass_model_exec = False
+        hidden_or_intermediate_states = None # Initialize
         if self.need_recv_kv(model_input, kv_caches):
             hidden_or_intermediate_states, bypass_model_exec, model_input = \
                 get_kv_transfer_group().recv_kv_caches_and_hidden_states(
-                    # model is used to know which layer the current worker
-                    # is working on, so that we can receive KV for only those
-                    # layers.
                     model_executable,
                     model_input,
                     kv_caches=kv_caches
                 )
+        # --- End Existing KV Cache Recv Logic ---
 
         multi_modal_kwargs = model_input.multi_modal_kwargs or {}
         seqlen_agnostic_kwargs = {
@@ -1767,6 +1768,11 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
         model_kwargs = {}
         if previous_hidden_states is not None:
             model_kwargs["previous_hidden_states"] = previous_hidden_states
+
+        # Will store stats collected in *this* stage
+        current_stage_stats_tensors: Dict[str, torch.Tensor] = {}
+        current_rank = get_pp_group().get_local_rank()
+
         if (self.observability_config is not None
                 and self.observability_config.collect_model_forward_time):
             model_forward_start = torch.cuda.Event(enable_timing=True)
@@ -1776,6 +1782,7 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
         if not bypass_model_exec:
             with set_forward_context(model_input.attn_metadata,
                                      self.vllm_config, virtual_engine):
+                # Execute the model
                 hidden_or_intermediate_states = model_executable(
                     input_ids=model_input.input_tokens,
                     positions=model_input.input_positions,
@@ -1786,43 +1793,88 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
                     **model_kwargs,
                 )
 
+                # --- Start New Logic: Accumulate stats from context --- #
+                fwd_ctx = get_forward_context()
+                if fwd_ctx.attn_stats is not None:
+                    stats_prefix = f"pp_rank_{current_rank}_"
+                    # Iterate through the stats dictionary and add prefixed tensors
+                    for stat_name, stat_tensor in fwd_ctx.attn_stats.items():
+                        current_stage_stats_tensors[f"{stats_prefix}{stat_name}"] = stat_tensor
+                # --- End New Logic ---
+        elif intermediate_tensors is not None:
+             # If bypassed, potentially carry forward hidden states if they were received
+             if "hidden_states" in intermediate_tensors.tensors:
+                 hidden_or_intermediate_states = intermediate_tensors.tensors["hidden_states"]
+             # If bypassed, current_stage_stats_tensors remains empty, which is correct.
+
         if (self.observability_config is not None
                 and self.observability_config.collect_model_forward_time):
             model_forward_end.record()
 
-        # Sending KV cache in distributed KV cache transfer setting
-        # NOTE: the send operation is non-blocking
+        # --- Start Existing KV Cache Send Logic ---
         if self.need_send_kv(model_input, kv_caches):
             get_kv_transfer_group().send_kv_caches_and_hidden_states(
-                # model_executable is used to know which layer the current
-                # worker is working on, so that we can send KV for only those
-                # layers.
                 model_executable,
                 model_input,
                 kv_caches,
-                hidden_or_intermediate_states,
+                hidden_or_intermediate_states, # Send what was computed or received
             )
+        # --- End Existing KV Cache Send Logic ---
 
-        # Compute the logits in the last pipeline stage.
+        # --- Start Modified Logic: Handle Intermediate Ranks ---
         if not get_pp_group().is_last_rank:
+            # Prepare outgoing tensors dictionary
+            outgoing_tensors: Dict[str, torch.Tensor] = {}
+            # 1. Copy tensors received from previous stage (if any)
+            if intermediate_tensors is not None:
+                outgoing_tensors.update(intermediate_tensors.tensors)
+            # 2. Add or update the main hidden state tensor
+            if isinstance(hidden_or_intermediate_states, torch.Tensor):
+                outgoing_tensors["hidden_states"] = hidden_or_intermediate_states
+            elif isinstance(hidden_or_intermediate_states, IntermediateTensors): # Should not happen if logic above is correct, but handle defensively
+                 if "hidden_states" in hidden_or_intermediate_states.tensors:
+                      outgoing_tensors["hidden_states"] = hidden_or_intermediate_states.tensors["hidden_states"]
+            # 3. Add the *new* tensors collected in this stage
+            outgoing_tensors.update(current_stage_stats_tensors)
+
+            # Handle model_forward_time accumulation (must happen *after* updating outgoing_tensors)
             if (self.is_driver_worker
-                    and hidden_or_intermediate_states is not None
-                    and isinstance(hidden_or_intermediate_states,
-                                   IntermediateTensors)
                     and self.observability_config is not None
                     and self.observability_config.collect_model_forward_time):
                 model_forward_end.synchronize()
-                model_forward_time = model_forward_start.elapsed_time(
-                    model_forward_end)
-                orig_model_forward_time = 0.0
+                current_stage_time = model_forward_start.elapsed_time(model_forward_end)
+                previous_stages_time = 0.0
+                # Get accumulated time *from the input intermediate_tensors*
                 if intermediate_tensors is not None:
-                    orig_model_forward_time = intermediate_tensors.tensors.get(
+                    previous_stages_time = intermediate_tensors.tensors.get(
                         "model_forward_time", torch.tensor(0.0)).item()
-                hidden_or_intermediate_states.tensors["model_forward_time"] = (
-                    torch.tensor(model_forward_time + orig_model_forward_time))
-            return hidden_or_intermediate_states
+                # Add/update the time in the *outgoing* dictionary
+                outgoing_tensors["model_forward_time"] = torch.tensor(
+                    current_stage_time + previous_stages_time, device=self.device
+                )
 
-        logits = self.model.compute_logits(hidden_or_intermediate_states,
+            # Return the new IntermediateTensors object
+            return IntermediateTensors(outgoing_tensors)
+        # --- End Modified Logic: Handle Intermediate Ranks ---
+
+        # --- Start Modified Logic: Handle Last Rank ---
+        # Extract the final hidden states tensor needed for logits
+        final_hidden_states_tensor = None
+        all_incoming_tensors = {}
+        if intermediate_tensors is not None:
+             all_incoming_tensors.update(intermediate_tensors.tensors)
+        if isinstance(hidden_or_intermediate_states, torch.Tensor):
+            final_hidden_states_tensor = hidden_or_intermediate_states
+            # Also add it to the dict if needed for stats reconstruction
+            all_incoming_tensors["hidden_states"] = final_hidden_states_tensor
+        else: # Should only be None if bypassed and nothing was received
+             final_hidden_states_tensor = all_incoming_tensors.get("hidden_states")
+
+        if final_hidden_states_tensor is None:
+             raise ValueError("Last rank did not receive or compute final hidden states for logits.")
+
+        # Compute logits
+        logits = self.model.compute_logits(final_hidden_states_tensor,
                                            model_input.sampling_metadata)
 
         if not self.is_driver_worker:
@@ -1831,42 +1883,70 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
         if model_input.async_callback is not None:
             model_input.async_callback()
 
-        # Sample the next token.
+        # Sample the next token
         output: SamplerOutput = self.model.sample(
             logits=logits,
             sampling_metadata=model_input.sampling_metadata,
         )
-        if (self.observability_config is not None
-                and self.observability_config.collect_model_forward_time
-                and output is not None):
-            model_forward_end.synchronize()
-            model_forward_time = model_forward_start.elapsed_time(
-                model_forward_end)
-            orig_model_forward_time = 0.0
-            if intermediate_tensors is not None:
-                orig_model_forward_time = intermediate_tensors.tensors.get(
-                    "model_forward_time", torch.tensor(0.0)).item()
-            # If there are multiple workers, we are still tracking the latency
-            # from the start time of the driver worker to the end time of the
-            # driver worker. The model forward time will then end up covering
-            # the communication time as well.
-            output.model_forward_time = (orig_model_forward_time +
-                                         model_forward_time)
 
-        if self.return_hidden_states:
-            # we only need to pass hidden states of most recent token
+        # --- Start New Logic: Reconstruct final stats and add to output ---
+        if output is not None:
+            final_step_stats = {}
+            # Combine tensors received from previous stages with tensors from this (last) stage
+            all_tensors_for_stats = all_incoming_tensors.copy()
+            all_tensors_for_stats.update(current_stage_stats_tensors)
+
+            # Reconstruct the nested dictionary structure if needed, or just pass flat dict
+            # Example: Reconstructing nested structure
+            stats_by_rank = defaultdict(dict)
+            for key, tensor in all_tensors_for_stats.items():
+                 if key.startswith("pp_rank_"):
+                     parts = key.split('_')
+                     if len(parts) >= 4:
+                         rank_id = int(parts[2])
+                         stat_name = "_".join(parts[3:])
+                         # Optionally convert 0-dim tensors back to scalars
+                         # stat_value = tensor.item() if tensor.numel() == 1 else tensor
+                         stat_value = tensor # Keep as tensor for now
+                         stats_by_rank[f"pp_rank_{rank_id}"][stat_name] = stat_value
+            final_step_stats = dict(stats_by_rank)
+
+            # Attach the reconstructed stats dictionary to the output
+            output.step_stats = final_step_stats
+
+            # --- End New Logic ---
+
+            # Add accumulated model_forward_time
+            if (self.observability_config is not None
+                    and self.observability_config.collect_model_forward_time):
+                model_forward_end.synchronize()
+                current_stage_time = model_forward_start.elapsed_time(model_forward_end)
+                previous_stages_time = 0.0
+                # Get accumulated time *from the input intermediate_tensors*
+                if intermediate_tensors is not None:
+                    previous_stages_time = intermediate_tensors.tensors.get(
+                        "model_forward_time", torch.tensor(0.0)).item()
+                output.model_forward_time = previous_stages_time + current_stage_time
+
+            # Add accumulated_attn_stats (aggregates across execute_model calls)
+            output.attn_stats = dict(self.accumulated_attn_stats)
+
+        # Handle hidden states output (existing logic, ensure using final_hidden_states_tensor)
+        if self.return_hidden_states and output is not None:
             assert model_input.sampling_metadata is not None
             indices = model_input.sampling_metadata.selected_token_indices
-            if model_input.is_prompt:
-                hidden_states = hidden_or_intermediate_states.index_select(
-                    0, indices)
-                output.prefill_hidden_states = hidden_or_intermediate_states
-            elif decode_meta.use_cuda_graph:
-                hidden_states = hidden_or_intermediate_states[:len(indices)]
-            else:
-                hidden_states = hidden_or_intermediate_states
+            hidden_states_for_output = final_hidden_states_tensor
 
-            output.hidden_states = hidden_states
+            if model_input.is_prompt:
+                selected_hidden_states = hidden_states_for_output.index_select(0, indices)
+                output.prefill_hidden_states = hidden_states_for_output
+                output.hidden_states = selected_hidden_states
+            elif decode_meta.use_cuda_graph:
+                selected_hidden_states = hidden_states_for_output[:len(indices)]
+                output.hidden_states = selected_hidden_states
+            else:  # Standard decode
+                hidden_states = final_hidden_states_tensor[:len(indices)]
+                output.hidden_states = hidden_states
 
         return [output]
 

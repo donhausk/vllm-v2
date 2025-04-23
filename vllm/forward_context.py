@@ -3,8 +3,8 @@
 import time
 from collections import defaultdict
 from contextlib import contextmanager
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Optional
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch
 import torch.distributed as dist
@@ -44,6 +44,10 @@ class ForwardContext:
     virtual_engine: int  # set dynamically for each forward pass
     # set dynamically for each forward pass
     dp_metadata: Optional[DPMetadata] = None
+    # Holds attention statistics for the current forward pass as tensors
+    attn_stats: Optional[Dict[str, torch.Tensor]] = None
+
+    vllm_config: Optional[VllmConfig] = None
 
 
 _forward_context: Optional[ForwardContext] = None
@@ -101,7 +105,46 @@ def set_forward_context(attn_metadata: Any,
         static_forward_context,
         virtual_engine=virtual_engine,
         attn_metadata=attn_metadata,
-        dp_metadata=dp_metadata)
+        dp_metadata=dp_metadata,
+        vllm_config=vllm_config) # Required for the attention type
+
+    # Populate attention stats if metadata is available
+    if _forward_context.attn_metadata is not None:
+        _forward_context.attn_stats = {}
+        # Try fetching token counts, handle different backend versions/attributes
+        # Ensure stats are stored as tensors on the correct device
+        device = _forward_context.attn_metadata.device if hasattr(_forward_context.attn_metadata, 'device') else 'cuda' # Default device
+        try:
+            # Common attributes in AttentionMetadata
+            num_prefill = getattr(_forward_context.attn_metadata, "num_prefills", 0)
+            num_decode = getattr(_forward_context.attn_metadata, "num_decodes", 0)
+
+            num_prefill_tokens = 0
+            num_decode_tokens = 0
+
+            if num_prefill > 0:
+                 num_prefill_tokens = getattr(_forward_context.attn_metadata, "num_prefill_tokens", 0)
+            if num_decode > 0:
+                 num_decode_tokens = getattr(_forward_context.attn_metadata, "num_decode_tokens", 0)
+
+            # Fallback or alternative for v1 backends if specific attrs aren't present
+            if num_prefill == 0 and num_decode == 0:
+                 is_prompt = getattr(_forward_context.attn_metadata, "is_prompt", False) # Need heuristic if is_prompt is not direct attr
+                 num_tokens_fallback = getattr(_forward_context.attn_metadata, "num_input_tokens", 0)
+                 if is_prompt: # Simplified assumption: all tokens are prefill if it's a prompt phase
+                     num_prefill_tokens = num_tokens_fallback
+                 else:
+                     num_decode_tokens = num_tokens_fallback
+
+            _forward_context.attn_stats["num_prefill_tokens"] = torch.tensor(num_prefill_tokens, device=device, dtype=torch.long)
+            _forward_context.attn_stats["num_decode_tokens"] = torch.tensor(num_decode_tokens, device=device, dtype=torch.long)
+
+        except AttributeError as e:
+            # Log if expected attributes are missing, but don't crash
+            logger.debug(f"Could not populate token counts in AttentionStats: {e}")
+            # Initialize with zeros if attributes are missing
+            _forward_context.attn_stats["num_prefill_tokens"] = torch.tensor(0, device=device, dtype=torch.long)
+            _forward_context.attn_stats["num_decode_tokens"] = torch.tensor(0, device=device, dtype=torch.long)
 
     # KVConnector: trigger (possibly async) load before forward.
     # Each attn layer will block until the reading is complete.

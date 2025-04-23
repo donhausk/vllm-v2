@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Attention layer."""
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -210,6 +210,11 @@ class Attention(nn.Module):
                 forward_context: ForwardContext = get_forward_context()
                 attn_metadata = forward_context.attn_metadata
                 self_kv_cache = self.kv_cache[forward_context.virtual_engine]
+
+                start_event = torch.cuda.Event(enable_timing=True)
+                end_event = torch.cuda.Event(enable_timing=True)
+
+                start_event.record()
                 self.impl.forward(self,
                                   query,
                                   key,
@@ -217,6 +222,13 @@ class Attention(nn.Module):
                                   self_kv_cache,
                                   attn_metadata,
                                   output=output)
+                end_event.record()
+                torch.cuda.synchronize() # Ensure events are recorded
+                elapsed_time_ms = start_event.elapsed_time(end_event)
+
+                if forward_context.attn_stats is not None:
+                    # Store layer time as a tensor in the stats dictionary
+                    forward_context.attn_stats[f"layer_times_{self.layer_name}"] = torch.tensor(elapsed_time_ms, device=query.device, dtype=torch.float32)
             else:
                 torch.ops.vllm.unified_attention_with_output(
                     query, key, value, output, self.layer_name)
@@ -226,8 +238,23 @@ class Attention(nn.Module):
                 forward_context = get_forward_context()
                 attn_metadata = forward_context.attn_metadata
                 self_kv_cache = self.kv_cache[forward_context.virtual_engine]
-                return self.impl.forward(self, query, key, value,
+
+                start_event = torch.cuda.Event(enable_timing=True)
+                end_event = torch.cuda.Event(enable_timing=True)
+
+                start_event.record()
+                output, stats = self.impl.forward(self, query, key, value,
                                          self_kv_cache, attn_metadata)
+                end_event.record()
+                torch.cuda.synchronize() # Ensure events are recorded
+                elapsed_time_ms = start_event.elapsed_time(end_event)
+
+                if forward_context.attn_stats is not None:
+                    for key in stats:
+                        forward_context.attn_stats[f"{key}_{self.layer_name}"] = stats[key]
+                    # Store layer time as a tensor in the stats dictionary
+                    forward_context.attn_stats[f"layer_times_{self.layer_name}"] = torch.tensor(elapsed_time_ms, device=query.device, dtype=torch.float32)
+                return output
             else:
                 return torch.ops.vllm.unified_attention(
                     query, key, value, self.layer_name)
@@ -375,8 +402,20 @@ def unified_attention(
     attn_metadata = forward_context.attn_metadata
     self = forward_context.no_compile_layers[layer_name]
     kv_cache = self.kv_cache[forward_context.virtual_engine]
+
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+
+    start_event.record()
     output = self.impl.forward(self, query, key, value, kv_cache,
                                attn_metadata)
+    end_event.record()
+    torch.cuda.synchronize() # Ensure events are recorded
+    elapsed_time_ms = start_event.elapsed_time(end_event)
+
+    if forward_context.attn_stats is not None:
+        # Store layer time as a tensor in the stats dictionary
+        forward_context.attn_stats[f"layer_times_{layer_name}"] = torch.tensor(elapsed_time_ms, device=query.device, dtype=torch.float32)
 
     maybe_save_kv_layer_to_connector(layer_name, kv_cache)
     return output
@@ -412,6 +451,11 @@ def unified_attention_with_output(
     attn_metadata = forward_context.attn_metadata
     self = forward_context.no_compile_layers[layer_name]
     kv_cache = self.kv_cache[forward_context.virtual_engine]
+
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+
+    start_event.record()
     self.impl.forward(self,
                       query,
                       key,
@@ -419,6 +463,13 @@ def unified_attention_with_output(
                       kv_cache,
                       attn_metadata,
                       output=output)
+    end_event.record()
+    torch.cuda.synchronize() # Ensure events are recorded
+    elapsed_time_ms = start_event.elapsed_time(end_event)
+
+    if forward_context.attn_stats is not None:
+        # Store layer time as a tensor in the stats dictionary
+        forward_context.attn_stats[f"layer_times_{layer_name}"] = torch.tensor(elapsed_time_ms, device=query.device, dtype=torch.float32)
 
     maybe_save_kv_layer_to_connector(layer_name, kv_cache)
 
